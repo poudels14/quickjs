@@ -465,6 +465,9 @@ JS_EXTERN JSContext *JS_DupContext(JSContext *ctx);
 JS_EXTERN void *JS_GetContextOpaque(JSContext *ctx);
 JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
 JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);
+/* The caller should keep the variable in scope, other it will be freed by the GC */
+JS_EXTERN JSValue JS_SetExecutionContext(JSContext *ctx, JSValueConst execution_ctx);
+JS_EXTERN JSValue JS_GetExecutionContext(JSContext *ctx);
 JS_EXTERN void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
 JS_EXTERN JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);
 JS_EXTERN JSValue JS_GetFunctionProto(JSContext *ctx);

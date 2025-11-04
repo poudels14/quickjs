@@ -336,6 +336,10 @@ struct JSClass {
     /* pointers for exotic behavior, can be NULL if none are present */
     const JSClassExoticMethods *exotic;
 };
+typedef struct JSExecutionContext {
+    bool explicit;
+    JSObject *context;
+} JSExecutionContext;
 
 typedef struct JSStackFrame {
     struct JSStackFrame *prev_frame; /* NULL if first stack frame */
@@ -350,6 +354,7 @@ typedef struct JSStackFrame {
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
+    JSExecutionContext execution_ctx;
 } JSStackFrame;
 
 typedef enum {
@@ -1977,6 +1982,53 @@ size_t JS_GetGCThreshold(JSRuntime *rt) {
 void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold)
 {
     rt->malloc_gc_threshold = gc_threshold;
+}
+
+/* this frees the execution context if it's not same as context from previous stack frame */
+void clear_execution_context(JSRuntime *rt, JSStackFrame *frame) {
+    if (frame && frame->execution_ctx.explicit) {
+        JSValue execution_ctx = JS_MKPTR(JS_TAG_OBJECT, frame->execution_ctx.context);
+        JS_FreeValueRT(rt, execution_ctx);
+        frame->execution_ctx.explicit = false;
+        frame->execution_ctx.context = NULL;
+    }
+}
+
+JSValue JS_SetExecutionContext(JSContext *ctx, JSValueConst context)
+{
+    if (!JS_IsObject(context)) {
+        return JS_UNDEFINED;
+    }
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    if (sf != NULL) {
+        /* clear explicitly set context */
+        if (sf->execution_ctx.explicit) {
+            JSValue execution_ctx = JS_MKPTR(JS_TAG_OBJECT, sf->execution_ctx.context);
+            JS_FreeValue(ctx, execution_ctx);
+        }
+        sf->execution_ctx.explicit = true;
+        sf->execution_ctx.context = JS_VALUE_GET_OBJ(js_dup(context));
+        return js_dup(context);
+    }
+    return JS_UNDEFINED;
+}
+
+
+JSValue JS_GetExecutionContext(JSContext *ctx)
+{
+    JSStackFrame *sf = ctx->rt->current_stack_frame;
+    if (sf && sf->execution_ctx.context) {
+        JSValue context = JS_MKPTR(JS_TAG_OBJECT, sf->execution_ctx.context);
+        return js_dup(context);
+    }
+    return JS_UNDEFINED;
+}
+
+void derive_execution_context(JSRuntime *rt, JSExecutionContext *dest) {
+    if (rt->current_stack_frame && rt->current_stack_frame->execution_ctx.context) {
+        dest->explicit = false;
+        dest->context = rt->current_stack_frame->execution_ctx.context;
+    }
 }
 
 #define malloc(s) malloc_is_forbidden(s)
@@ -5445,7 +5497,8 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
                                        int argc, JSValueConst *argv, int flags)
 {
     JSRuntime *rt = ctx->rt;
-    JSStackFrame sf_s, *sf = &sf_s, *prev_sf;
+    JSStackFrame sf_s = {0};
+    JSStackFrame *sf = &sf_s, *prev_sf;
     JSCFunctionDataRecord *s;
     JSValueConst *arg_buf;
     JSValue ret;
@@ -5470,6 +5523,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     }
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
+    derive_execution_context(rt, &sf->execution_ctx);
     rt->current_stack_frame = sf;
     // TODO(bnoordhuis) switch realms like js_call_c_function does
     sf->is_strict_mode = false;
@@ -16017,7 +16071,8 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
     JSRuntime *rt = ctx->rt;
     JSCFunctionType func;
     JSObject *p;
-    JSStackFrame sf_s, *sf = &sf_s, *prev_sf;
+    JSStackFrame sf_s = {0};
+    JSStackFrame *sf = &sf_s, *prev_sf;
     JSValue ret_val;
     JSValueConst *arg_buf;
     int arg_count, i;
@@ -16033,6 +16088,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
+    derive_execution_context(rt, &sf->execution_ctx);
     rt->current_stack_frame = sf;
     ctx = p->u.cfunc.realm; /* change the current realm */
 
@@ -16216,7 +16272,8 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     JSContext *ctx;
     JSObject *p;
     JSFunctionBytecode *b;
-    JSStackFrame sf_s, *sf = &sf_s;
+    JSStackFrame sf_s = {0};
+    JSStackFrame *sf = &sf_s;
     uint8_t *pc;
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
@@ -16267,6 +16324,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
             sf->prev_frame = rt->current_stack_frame;
+            derive_execution_context(rt, &sf->execution_ctx);
             rt->current_stack_frame = sf;
             if (s->throw_flag)
                 goto exception;
@@ -16330,6 +16388,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
     sf->prev_frame = rt->current_stack_frame;
+    derive_execution_context(rt, &sf->execution_ctx);
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
 
@@ -18729,6 +18788,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->cur_sp = sp;
     } else {
     done:
+        clear_execution_context(rt, sf);
         if (unlikely(!list_empty(&sf->var_ref_list))) {
             /* variable references reference the stack: must close them */
             close_var_refs(rt, sf);
@@ -18993,6 +19053,7 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     }
     JS_FreeValueRT(rt, sf->cur_func);
     JS_FreeValueRT(rt, s->this_val);
+    clear_execution_context(rt, sf);
 }
 
 static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
