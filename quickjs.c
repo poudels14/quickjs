@@ -299,6 +299,8 @@ struct JSRuntime {
     // for smuggling the parent promise from js_promise_then
     // to js_promise_constructor
     JSValueLink *parent_promise;
+    // for smuggling the execution context from promise_reaction_job
+    JSValue promise_execution_context;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -336,10 +338,6 @@ struct JSClass {
     /* pointers for exotic behavior, can be NULL if none are present */
     const JSClassExoticMethods *exotic;
 };
-typedef struct JSExecutionContext {
-    bool explicit;
-    JSObject *context;
-} JSExecutionContext;
 
 typedef struct JSStackFrame {
     struct JSStackFrame *prev_frame; /* NULL if first stack frame */
@@ -354,7 +352,7 @@ typedef struct JSStackFrame {
     /* only used in generators. Current stack pointer value. NULL if
        the function is running. */
     JSValue *cur_sp;
-    JSExecutionContext execution_ctx;
+    JSValue *execution_ctx;
 } JSStackFrame;
 
 typedef enum {
@@ -1984,16 +1982,6 @@ void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold)
     rt->malloc_gc_threshold = gc_threshold;
 }
 
-/* this frees the execution context if it's not same as context from previous stack frame */
-void clear_execution_context(JSRuntime *rt, JSStackFrame *frame) {
-    if (frame && frame->execution_ctx.explicit) {
-        JSValue execution_ctx = JS_MKPTR(JS_TAG_OBJECT, frame->execution_ctx.context);
-        JS_FreeValueRT(rt, execution_ctx);
-        frame->execution_ctx.explicit = false;
-        frame->execution_ctx.context = NULL;
-    }
-}
-
 JSValue JS_SetExecutionContext(JSContext *ctx, JSValueConst context)
 {
     if (!JS_IsObject(context)) {
@@ -2001,13 +1989,17 @@ JSValue JS_SetExecutionContext(JSContext *ctx, JSValueConst context)
     }
     JSStackFrame *sf = ctx->rt->current_stack_frame;
     if (sf != NULL) {
-        /* clear explicitly set context */
-        if (sf->execution_ctx.explicit) {
-            JSValue execution_ctx = JS_MKPTR(JS_TAG_OBJECT, sf->execution_ctx.context);
-            JS_FreeValue(ctx, execution_ctx);
+        JSValue *new_context = sf->execution_ctx;
+        if (sf->execution_ctx != NULL) {
+            JS_FreeValue(ctx, *(sf->execution_ctx));
+        } else {
+            new_context = js_malloc(ctx, sizeof(JSValue));
         }
-        sf->execution_ctx.explicit = true;
-        sf->execution_ctx.context = JS_VALUE_GET_OBJ(js_dup(context));
+        if (new_context == NULL) {
+            return js_dup(context);
+        }
+        *new_context = js_dup(context);
+        sf->execution_ctx = new_context;
         return js_dup(context);
     }
     return JS_UNDEFINED;
@@ -2017,17 +2009,53 @@ JSValue JS_SetExecutionContext(JSContext *ctx, JSValueConst context)
 JSValue JS_GetExecutionContext(JSContext *ctx)
 {
     JSStackFrame *sf = ctx->rt->current_stack_frame;
-    if (sf && sf->execution_ctx.context) {
-        JSValue context = JS_MKPTR(JS_TAG_OBJECT, sf->execution_ctx.context);
-        return js_dup(context);
+    if (sf && sf->execution_ctx) {
+        return js_dup(*sf->execution_ctx);
     }
     return JS_UNDEFINED;
 }
 
-void derive_execution_context(JSRuntime *rt, JSExecutionContext *dest) {
-    if (rt->current_stack_frame && rt->current_stack_frame->execution_ctx.context) {
-        dest->explicit = false;
-        dest->context = rt->current_stack_frame->execution_ctx.context;
+
+static inline void free_execution_context(JSRuntime *rt, JSValue **execution_ctx) {
+    if (!execution_ctx || !*execution_ctx)
+        return;
+    JS_FreeValueRT(rt, **execution_ctx);
+    js_free_rt(rt, *execution_ctx);
+    *execution_ctx = NULL;
+}
+
+static inline JSValue clone_current_execution_context(JSRuntime *rt) {
+    if (rt->current_stack_frame && rt->current_stack_frame->execution_ctx) {
+        return js_dup(*rt->current_stack_frame->execution_ctx);
+    }
+    return JS_UNDEFINED;
+}
+
+static inline void set_stack_frame_execution_context(JSRuntime *rt, JSStackFrame *sf) {
+    /* the execution context is already set if the function is resuming */
+    if (sf->execution_ctx) {
+        return;
+    }
+
+    JSValue captured = JS_UNDEFINED;
+    if (rt->current_stack_frame && rt->current_stack_frame->execution_ctx) {
+        captured = js_dup(*rt->current_stack_frame->execution_ctx);
+    } else if (!JS_IsUndefined(rt->promise_execution_context)) {
+        captured = rt->promise_execution_context;
+        rt->promise_execution_context = JS_UNDEFINED;
+    }
+    if (JS_IsUndefined(captured)) {
+        return;
+    }
+    sf->execution_ctx = js_malloc_rt(rt, sizeof(JSValue));
+    if (!sf->execution_ctx)
+        return;
+    *sf->execution_ctx = captured;
+}
+
+static inline void free_stack_frame_execution_context(JSRuntime *rt, JSStackFrame *sf) {
+    if (sf) {
+        free_execution_context(rt, &sf->execution_ctx);
     }
 }
 
@@ -5523,13 +5551,14 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     }
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
-    derive_execution_context(rt, &sf->execution_ctx);
+    set_stack_frame_execution_context(rt, sf);
     rt->current_stack_frame = sf;
     // TODO(bnoordhuis) switch realms like js_call_c_function does
     sf->is_strict_mode = false;
     sf->cur_func = unsafe_unconst(func_obj);
     sf->arg_count = argc;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
+    free_stack_frame_execution_context(rt, sf);
     rt->current_stack_frame = sf->prev_frame;
     return ret;
 }
@@ -16088,7 +16117,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
 
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
-    derive_execution_context(rt, &sf->execution_ctx);
+    set_stack_frame_execution_context(rt, sf);
     rt->current_stack_frame = sf;
     ctx = p->u.cfunc.realm; /* change the current realm */
 
@@ -16192,6 +16221,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
         abort();
     }
 
+    free_stack_frame_execution_context(rt, sf);
     rt->current_stack_frame = sf->prev_frame;
     return ret_val;
 }
@@ -16324,7 +16354,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
             pc = sf->cur_pc;
             sf->prev_frame = rt->current_stack_frame;
-            derive_execution_context(rt, &sf->execution_ctx);
+            set_stack_frame_execution_context(rt, sf);
             rt->current_stack_frame = sf;
             if (s->throw_flag)
                 goto exception;
@@ -16388,7 +16418,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     /* sf->cur_pc must we set to pc before any recursive calls to JS_CallInternal. */
     sf->cur_pc = NULL;
     sf->prev_frame = rt->current_stack_frame;
-    derive_execution_context(rt, &sf->execution_ctx);
+    set_stack_frame_execution_context(rt, sf);
     rt->current_stack_frame = sf;
     ctx = b->realm; /* set the current realm */
 
@@ -18788,7 +18818,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         sf->cur_sp = sp;
     } else {
     done:
-        clear_execution_context(rt, sf);
+        free_stack_frame_execution_context(rt, sf);
         if (unlikely(!list_empty(&sf->var_ref_list))) {
             /* variable references reference the stack: must close them */
             close_var_refs(rt, sf);
@@ -19039,6 +19069,7 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     JSValue *sp;
 
     sf = &s->frame;
+    free_stack_frame_execution_context(rt, sf);
 
     /* close the closure variables. */
     close_var_refs(rt, sf);
@@ -19053,7 +19084,6 @@ static void async_func_free(JSRuntime *rt, JSAsyncFunctionState *s)
     }
     JS_FreeValueRT(rt, sf->cur_func);
     JS_FreeValueRT(rt, s->this_val);
-    clear_execution_context(rt, sf);
 }
 
 static JSValue async_func_resume(JSContext *ctx, JSAsyncFunctionState *s)
@@ -50497,6 +50527,7 @@ typedef struct JSPromiseReactionData {
     struct list_head link; /* not used in promise_reaction_job */
     JSValue resolving_funcs[2];
     JSValue handler;
+    JSValue context;
 } JSPromiseReactionData;
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
@@ -50531,6 +50562,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
     JS_FreeValueRT(rt, rd->resolving_funcs[0]);
     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
     JS_FreeValueRT(rt, rd->handler);
+    JS_FreeValueRT(rt, rd->context);
     js_free_rt(rt, rd);
 }
 
@@ -50552,12 +50584,17 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     JSValueConst arg;
     bool is_reject;
 
-    assert(argc == 5);
+    assert(argc == 6);
     handler = argv[2];
     is_reject = JS_ToBool(ctx, argv[3]);
     arg = argv[4];
 
     promise_trace(ctx, "promise_reaction_job: is_reject=%d\n", is_reject);
+
+    if (!JS_IsUndefined(ctx->rt->promise_execution_context)) {
+        JS_FreeValue(ctx, ctx->rt->promise_execution_context);
+    }
+    ctx->rt->promise_execution_context = js_dup(argv[5]);
 
     if (JS_IsUndefined(handler)) {
         if (is_reject) {
@@ -50608,7 +50645,8 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     struct list_head *el, *el1;
     JSPromiseReactionData *rd;
-    JSValueConst args[5];
+    JSValueConst args[6];
+
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
@@ -50638,8 +50676,9 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[1] = rd->resolving_funcs[1];
         args[2] = rd->handler;
         args[3] = js_bool(is_reject);
-        args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        args[4] = s->promise_result;
+        args[5] = rd->context;
+        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -50765,7 +50804,7 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
     JSObject *p = JS_VALUE_GET_OBJ(func_obj);
     JSPromiseFunctionData *s;
     JSValueConst args[3];
-    JSValueConst resolution;
+    JSValueConst resolution = JS_UNDEFINED;
     JSValue then;
     bool is_reject;
 
@@ -50776,8 +50815,7 @@ static JSValue js_promise_resolve_function_call(JSContext *ctx,
     is_reject = p->class_id - JS_CLASS_PROMISE_RESOLVE_FUNCTION;
     if (argc > 0)
         resolution = argv[0];
-    else
-        resolution = JS_UNDEFINED;
+
 #ifdef ENABLE_DUMPS // JS_DUMP_PROMISE
     if (check_dump_flag(ctx->rt, JS_DUMP_PROMISE)) {
         printf("js_promise_resolving_function_call: is_reject=%d resolution=", is_reject);
@@ -50847,6 +50885,7 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
             JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
             JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
             JS_MarkValue(rt, rd->handler, mark_func);
+            JS_MarkValue(rt, rd->context, mark_func);
         }
     }
     JS_MarkValue(rt, s->promise_result, mark_func);
@@ -51392,12 +51431,15 @@ static __exception int perform_promise_then(JSContext *ctx,
                 promise_reaction_data_free(ctx->rt, rd_array[0]);
             return -1;
         }
+        rd->context = JS_UNDEFINED;
         for(j = 0; j < 2; j++)
             rd->resolving_funcs[j] = js_dup(cap_resolving_funcs[j]);
         handler = resolve_reject[i];
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = js_dup(handler);
+        rd->context = JS_UNDEFINED;
+        rd->context = clone_current_execution_context(ctx->rt);
         rd_array[i] = rd;
     }
 
@@ -51405,7 +51447,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         for(i = 0; i < 2; i++)
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {
-        JSValueConst args[5];
+        JSValueConst args[6];
         if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
             JSRuntime *rt = ctx->rt;
             if (rt->host_promise_rejection_tracker)
@@ -51419,7 +51461,8 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = js_bool(i);
         args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        args[5] = rd->context;
+        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }
