@@ -320,6 +320,9 @@ struct JSRuntime {
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
+    JSUnhandledPromiseRejectionTracker *unhandled_promise_rejection_tracker;
+    void *unhandled_promise_rejection_tracker_opaque;
+    struct list_head unhandled_promise_rejection_list;
 
     struct list_head job_list; /* list of JSJobEntry.link */
 
@@ -987,6 +990,13 @@ typedef struct JSJobEntry {
     JSValue argv[];
 } JSJobEntry;
 
+typedef struct JSUnhandledPromiseRejectionEntry {
+    struct list_head link;
+    JSContext *ctx;
+    JSValue promise;
+    JSValue reason;
+} JSUnhandledPromiseRejectionEntry;
+
 typedef struct JSProperty {
     union {
         JSValue value;      /* JS_PROP_NORMAL */
@@ -1389,6 +1399,9 @@ static __exception int perform_promise_then(JSContext *ctx,
                                             JSValueConst promise,
                                             JSValueConst *resolve_reject,
                                             JSValueConst *cap_resolving_funcs);
+static void untrack_unhandled_promise_rejection(JSContext *ctx,
+                                                JSValueConst promise);
+static void js_flush_unhandled_promise_rejection_tracker(JSRuntime *rt);
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
@@ -1961,6 +1974,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     init_list_head(&rt->string_list);
 #endif
     init_list_head(&rt->job_list);
+    init_list_head(&rt->unhandled_promise_rejection_list);
 
     if (JS_InitAtoms(rt))
         goto fail;
@@ -2221,9 +2235,14 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
     JSValue res;
     int i, ret;
 
-    if (list_empty(&rt->job_list)) {
-        *pctx = NULL;
-        return 0;
+    for(;;) {
+        if (!list_empty(&rt->job_list))
+            break;
+        js_flush_unhandled_promise_rejection_tracker(rt);
+        if (list_empty(&rt->job_list)) {
+            *pctx = NULL;
+            return 0;
+        }
     }
 
     /* get the first pending job and execute it */
@@ -2342,6 +2361,17 @@ void JS_FreeRuntime(JSRuntime *rt)
         js_free_rt(rt, e);
     }
     init_list_head(&rt->job_list);
+
+    list_for_each_safe(el, el1, &rt->unhandled_promise_rejection_list) {
+        JSUnhandledPromiseRejectionEntry *rp =
+            list_entry(el, JSUnhandledPromiseRejectionEntry, link);
+        list_del(&rp->link);
+        JS_FreeValueRT(rt, rp->promise);
+        JS_FreeValueRT(rt, rp->reason);
+        JS_FreeContext(rp->ctx);
+        js_free_rt(rt, rp);
+    }
+    init_list_head(&rt->unhandled_promise_rejection_list);
 
     JS_RunGC(rt);
 
@@ -52247,6 +52277,9 @@ JSValue JS_PromiseResult(JSContext *ctx, JSValueConst promise)
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     if (!s)
         return JS_UNDEFINED;
+    if (s->promise_state == JS_PROMISE_REJECTED &&
+        ctx->rt->unhandled_promise_rejection_tracker)
+        untrack_unhandled_promise_rejection(ctx, promise);
     return js_dup(s->promise_result);
 }
 
@@ -52343,6 +52376,112 @@ void JS_SetHostPromiseRejectionTracker(JSRuntime *rt,
     rt->host_promise_rejection_tracker_opaque = opaque;
 }
 
+static void
+free_unhandled_promise_rejection(JSRuntime *rt,
+                                 JSUnhandledPromiseRejectionEntry *rp)
+{
+    list_del(&rp->link);
+    JS_FreeValueRT(rt, rp->promise);
+    JS_FreeValueRT(rt, rp->reason);
+    JS_FreeContext(rp->ctx);
+    js_free_rt(rt, rp);
+}
+
+static void
+track_unhandled_promise_rejection(JSContext *ctx, JSValueConst promise,
+                                  JSValueConst reason)
+{
+    JSRuntime *rt;
+    JSObject *promise_obj;
+    struct list_head *el;
+    JSUnhandledPromiseRejectionEntry *rp;
+
+    if (JS_VALUE_GET_TAG(promise) != JS_TAG_OBJECT)
+        return;
+
+    rt = ctx->rt;
+    promise_obj = JS_VALUE_GET_OBJ(promise);
+    list_for_each(el, &rt->unhandled_promise_rejection_list) {
+        rp = list_entry(el, JSUnhandledPromiseRejectionEntry, link);
+        if (JS_VALUE_GET_OBJ(rp->promise) == promise_obj) {
+            set_value(ctx, &rp->reason, js_dup(reason));
+            return;
+        }
+    }
+
+    rp = js_mallocz_rt(rt, sizeof(*rp));
+    if (!rp)
+        return;
+
+    rp->ctx = JS_DupContext(ctx);
+    rp->promise = js_dup(promise);
+    rp->reason = js_dup(reason);
+    list_add_tail(&rp->link, &rt->unhandled_promise_rejection_list);
+}
+
+static void untrack_unhandled_promise_rejection(JSContext *ctx,
+                                                JSValueConst promise)
+{
+    JSRuntime *rt;
+    JSObject *promise_obj;
+    struct list_head *el, *el1;
+
+    if (JS_VALUE_GET_TAG(promise) != JS_TAG_OBJECT)
+        return;
+
+    rt = ctx->rt;
+    promise_obj = JS_VALUE_GET_OBJ(promise);
+    list_for_each_safe(el, el1, &rt->unhandled_promise_rejection_list) {
+        JSUnhandledPromiseRejectionEntry *rp =
+            list_entry(el, JSUnhandledPromiseRejectionEntry, link);
+        if (JS_VALUE_GET_OBJ(rp->promise) == promise_obj) {
+            free_unhandled_promise_rejection(rt, rp);
+            break;
+        }
+    }
+}
+
+static void js_flush_unhandled_promise_rejection_tracker(JSRuntime *rt)
+{
+    struct list_head pending;
+
+    init_list_head(&pending);
+    while (!list_empty(&rt->unhandled_promise_rejection_list)) {
+        struct list_head *el = rt->unhandled_promise_rejection_list.next;
+        list_del(el);
+        list_add_tail(el, &pending);
+    }
+
+    while (!list_empty(&pending)) {
+        struct list_head *el = pending.next;
+        JSUnhandledPromiseRejectionEntry *rp =
+            list_entry(el, JSUnhandledPromiseRejectionEntry, link);
+        bool should_report = false;
+
+        if (JS_VALUE_GET_TAG(rp->promise) == JS_TAG_OBJECT) {
+            JSPromiseData *s = JS_GetOpaque(rp->promise, JS_CLASS_PROMISE);
+            if (s && s->promise_state == JS_PROMISE_REJECTED && !s->is_handled)
+                should_report = true;
+        }
+
+        if (should_report && rt->unhandled_promise_rejection_tracker) {
+            rt->unhandled_promise_rejection_tracker(rp->ctx, rp->promise, rp->reason,
+                                                    rt->unhandled_promise_rejection_tracker_opaque);
+        }
+        free_unhandled_promise_rejection(rt, rp);
+    }
+}
+
+void JS_SetUnhandledPromiseRejectionTracker(JSRuntime *rt,
+                                            JSUnhandledPromiseRejectionTracker *cb,
+                                            void *opaque)
+{
+    rt->unhandled_promise_rejection_tracker = cb;
+    rt->unhandled_promise_rejection_tracker_opaque = opaque;
+    if (!cb)
+        js_flush_unhandled_promise_rejection_tracker(rt);
+}
+
 static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
                                       JSValueConst value, bool is_reject)
 {
@@ -52372,6 +52511,8 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         if (rt->host_promise_rejection_tracker)
             rt->host_promise_rejection_tracker(ctx, promise, value, false,
                                                rt->host_promise_rejection_tracker_opaque);
+        if (rt->unhandled_promise_rejection_tracker)
+            track_unhandled_promise_rejection(ctx, promise, value);
     }
 
     list_for_each_safe(el, el1, &s->promise_reactions[is_reject]) {
@@ -53157,6 +53298,8 @@ static __exception int perform_promise_then(JSContext *ctx,
             if (rt->host_promise_rejection_tracker)
                 rt->host_promise_rejection_tracker(ctx, promise, s->promise_result,
                                                    true, rt->host_promise_rejection_tracker_opaque);
+            if (rt->unhandled_promise_rejection_tracker)
+                untrack_unhandled_promise_rejection(ctx, promise);
         }
         i = s->promise_state - JS_PROMISE_FULFILLED;
         rd = rd_array[i];

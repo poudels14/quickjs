@@ -1144,6 +1144,12 @@ typedef void JSHostPromiseRejectionTracker(JSContext *ctx, JSValueConst promise,
                                            bool is_handled, void *opaque);
 JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRejectionTracker *cb, void *opaque);
 
+/* called only for rejected promises which remain unhandled */
+typedef void JSUnhandledPromiseRejectionTracker(JSContext *ctx, JSValueConst promise,
+                                                JSValueConst reason,
+                                                void *opaque);
+JS_EXTERN void JS_SetUnhandledPromiseRejectionTracker(JSRuntime *rt, JSUnhandledPromiseRejectionTracker *cb, void *opaque);
+
 /* return != 0 if the JS code needs to be interrupted */
 typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
