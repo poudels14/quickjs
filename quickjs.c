@@ -2146,7 +2146,42 @@ static inline JSValue clone_current_execution_context(JSRuntime *rt) {
     if (rt->current_stack_frame && rt->current_stack_frame->execution_ctx) {
         return js_dup(*rt->current_stack_frame->execution_ctx);
     }
+    if (!JS_IsUndefined(rt->promise_execution_context)) {
+        return js_dup(rt->promise_execution_context);
+    }
     return JS_UNDEFINED;
+}
+
+static inline void clear_promise_execution_context(JSContext *ctx) {
+    JSRuntime *rt = ctx->rt;
+
+    if (!JS_IsUndefined(rt->promise_execution_context)) {
+        JS_FreeValue(ctx, rt->promise_execution_context);
+        rt->promise_execution_context = JS_UNDEFINED;
+    }
+}
+
+static inline void replace_promise_execution_context(JSContext *ctx, JSValue value) {
+    JSRuntime *rt = ctx->rt;
+
+    if (!JS_IsUndefined(rt->promise_execution_context)) {
+        JS_FreeValue(ctx, rt->promise_execution_context);
+    }
+    rt->promise_execution_context = value;
+}
+
+static inline void capture_root_promise_execution_context(JSContext *ctx,
+                                                          JSStackFrame *sf) {
+    JSRuntime *rt = ctx->rt;
+    JSValue captured = JS_UNDEFINED;
+
+    if (sf->prev_frame == NULL && sf->execution_ctx) {
+        captured = js_dup(*sf->execution_ctx);
+    }
+    if (!JS_IsUndefined(rt->promise_execution_context)) {
+        JS_FreeValue(ctx, rt->promise_execution_context);
+    }
+    rt->promise_execution_context = captured;
 }
 
 static inline void set_stack_frame_execution_context(JSRuntime *rt, JSStackFrame *sf) {
@@ -2175,6 +2210,14 @@ static inline void free_stack_frame_execution_context(JSRuntime *rt, JSStackFram
     if (sf) {
         free_execution_context(rt, &sf->execution_ctx);
     }
+}
+
+static inline JSValue select_promise_reaction_context(JSValueConst attachment_context,
+                                                      JSValueConst promise_context)
+{
+    if (!JS_IsUndefined(promise_context))
+        return js_dup(promise_context);
+    return js_dup(attachment_context);
 }
 
 #define malloc(s) malloc_is_forbidden(s)
@@ -20087,10 +20130,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
        generator function. */
     if (b->func_kind != JS_FUNC_NORMAL) {
     done_generator:
+        capture_root_promise_execution_context(ctx, sf);
         sf->cur_pc = pc;
         sf->cur_sp = sp;
     } else {
     done:
+        capture_root_promise_execution_context(ctx, sf);
         free_stack_frame_execution_context(rt, sf);
         if (unlikely(sf->var_ref_count != 0)) {
             /* variable references reference the stack: must close them */
@@ -20320,6 +20365,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
     n = arg_buf_len + b->var_count;
     for(i = argc; i < n; i++)
         sf->arg_buf[i] = JS_UNDEFINED;
+    set_stack_frame_execution_context(ctx->rt, sf);
     return 0;
 }
 
@@ -20728,6 +20774,7 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
     JSValue promise;
     JSAsyncFunctionData *s;
 
+    promise = JS_UNDEFINED;
     s = js_mallocz(ctx, sizeof(*s));
     if (!s)
         return JS_EXCEPTION;
@@ -20737,10 +20784,6 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
     s->resolving_funcs[0] = JS_UNDEFINED;
     s->resolving_funcs[1] = JS_UNDEFINED;
 
-    promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
-    if (JS_IsException(promise))
-        goto fail;
-
     if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
     fail:
         JS_FreeValue(ctx, promise);
@@ -20748,6 +20791,10 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
         return JS_EXCEPTION;
     }
     s->is_active = true;
+
+    promise = JS_NewPromiseCapability(ctx, s->resolving_funcs);
+    if (JS_IsException(promise))
+        goto fail;
 
     if (!js_async_function_resume(ctx, s))
         goto fail;
@@ -52245,6 +52292,7 @@ typedef struct JSPromiseData {
     struct list_head promise_reactions[2];
     bool is_handled; /* Note: only useful to debug */
     JSValue promise_result;
+    JSValue context;
 } JSPromiseData;
 
 typedef struct JSPromiseFunctionDataResolved {
@@ -52328,10 +52376,7 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
 
     promise_trace(ctx, "promise_reaction_job: is_reject=%d\n", is_reject);
 
-    if (!JS_IsUndefined(ctx->rt->promise_execution_context)) {
-        JS_FreeValue(ctx, ctx->rt->promise_execution_context);
-    }
-    ctx->rt->promise_execution_context = js_dup(argv[5]);
+    replace_promise_execution_context(ctx, js_dup(argv[5]));
 
     if (JS_IsUndefined(handler)) {
         if (is_reject) {
@@ -52353,7 +52398,15 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
        creating a dummy promise in the 'await' implementation of async
        functions */
     if (!JS_IsUndefined(func)) {
+        JSValue reaction_context;
+        if (!JS_IsUndefined(ctx->rt->promise_execution_context)) {
+            reaction_context = js_dup(ctx->rt->promise_execution_context);
+        } else {
+            reaction_context = js_dup(argv[5]);
+        }
+        replace_promise_execution_context(ctx, reaction_context);
         res2 = JS_Call(ctx, func, JS_UNDEFINED, 1, vc(&res));
+        clear_promise_execution_context(ctx);
     } else {
         res2 = JS_UNDEFINED;
     }
@@ -52494,6 +52547,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
     set_value(ctx, &s->promise_result, js_dup(value));
+    set_value(ctx, &s->context, clone_current_execution_context(ctx->rt));
     s->promise_state = JS_PROMISE_FULFILLED + is_reject;
 
     promise_trace(ctx, "fulfill_or_reject_promise: is_reject=%d\n", is_reject);
@@ -52516,14 +52570,17 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     }
 
     list_for_each_safe(el, el1, &s->promise_reactions[is_reject]) {
+        JSValue job_context;
         rd = list_entry(el, JSPromiseReactionData, link);
+        job_context = select_promise_reaction_context(rd->context, s->context);
         args[0] = rd->resolving_funcs[0];
         args[1] = rd->resolving_funcs[1];
         args[2] = rd->handler;
         args[3] = js_bool(is_reject);
         args[4] = s->promise_result;
-        args[5] = rd->context;
+        args[5] = job_context;
         JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
+        JS_FreeValue(ctx, job_context);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -52711,6 +52768,7 @@ static void js_promise_finalizer(JSRuntime *rt, JSValueConst val)
         }
     }
     JS_FreeValueRT(rt, s->promise_result);
+    JS_FreeValueRT(rt, s->context);
     js_free_rt(rt, s);
 }
 
@@ -52734,6 +52792,7 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
         }
     }
     JS_MarkValue(rt, s->promise_result, mark_func);
+    JS_MarkValue(rt, s->context, mark_func);
 }
 
 static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target,
@@ -52760,6 +52819,7 @@ static JSValue js_promise_constructor(JSContext *ctx, JSValueConst new_target,
     for(i = 0; i < 2; i++)
         init_list_head(&s->promise_reactions[i]);
     s->promise_result = JS_UNDEFINED;
+    s->context = JS_UNDEFINED;
     JS_SetOpaqueInternal(obj, s);
     if (js_create_resolving_functions(ctx, args, obj))
         goto fail;
@@ -53283,7 +53343,6 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = js_dup(handler);
-        rd->context = JS_UNDEFINED;
         rd->context = clone_current_execution_context(ctx->rt);
         rd_array[i] = rd;
     }
@@ -53293,6 +53352,7 @@ static __exception int perform_promise_then(JSContext *ctx,
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {
         JSValueConst args[6];
+        JSValue job_context;
         if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
             JSRuntime *rt = ctx->rt;
             if (rt->host_promise_rejection_tracker)
@@ -53303,13 +53363,15 @@ static __exception int perform_promise_then(JSContext *ctx,
         }
         i = s->promise_state - JS_PROMISE_FULFILLED;
         rd = rd_array[i];
+        job_context = select_promise_reaction_context(rd->context, s->context);
         args[0] = rd->resolving_funcs[0];
         args[1] = rd->resolving_funcs[1];
         args[2] = rd->handler;
         args[3] = js_bool(i);
         args[4] = s->promise_result;
-        args[5] = rd->context;
+        args[5] = job_context;
         JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
+        JS_FreeValue(ctx, job_context);
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }
