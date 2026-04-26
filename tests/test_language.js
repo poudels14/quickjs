@@ -45,6 +45,24 @@ function assert_throws(expected_error, func, message)
     }
 }
 
+function assert_throws_message(expected_error, expected_message, func, message)
+{
+    var err = false;
+    var msg = message ? " (" + message + ")" : "";
+    try {
+        func();
+    } catch(e) {
+        err = true;
+        if (!(e instanceof expected_error)) {
+            throw Error(`expected ${expected_error.name}, got ${e.name}${msg}`);
+        }
+        assert(e.message, expected_message, message);
+    }
+    if (!err) {
+        throw Error(`expected ${expected_error.name}${msg}`);
+    }
+}
+
 /*----------------*/
 
 function test_op1()
@@ -266,6 +284,18 @@ function test_constructor()
     try { new G() } catch (ex_) { ex = ex_ }
     assert(ex instanceof TypeError)
     assert(ex.message, "G is not a constructor")
+}
+
+function test_not_a_function_message()
+{
+    var obj = {};
+    var local;
+    var arg = { value() { return 1; } };
+
+    assert_throws_message(TypeError, "missing is not a function",
+                          () => obj.missing(arg.value()));
+    assert_throws_message(TypeError, "local is not a function",
+                          () => local());
 }
 
 function test_prototype()
@@ -728,6 +758,7 @@ test_inc_dec();
 test_op2();
 test_delete();
 test_constructor();
+test_not_a_function_message();
 test_prototype();
 test_arguments();
 test_class();

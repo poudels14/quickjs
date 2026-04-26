@@ -101,10 +101,10 @@ DEF(          rot4l, 1, 4, 4, none) /* x a b c -> a b c x */
 DEF(          rot5l, 1, 5, 5, none) /* x a b c d -> a b c d x */
 
 DEF(call_constructor, 3, 2, 1, npop) /* func new.target args -> ret. arguments are not counted in n_pop */
-DEF(           call, 3, 1, 1, npop) /* arguments are not counted in n_pop */
-DEF(      tail_call, 3, 1, 0, npop) /* arguments are not counted in n_pop */
-DEF(    call_method, 3, 2, 1, npop) /* arguments are not counted in n_pop */
-DEF(tail_call_method, 3, 2, 0, npop) /* arguments are not counted in n_pop */
+DEF(           call, 7, 1, 1, atom_u16) /* arguments are not counted in n_pop */
+DEF(      tail_call, 7, 1, 0, atom_u16) /* arguments are not counted in n_pop */
+DEF(    call_method, 7, 2, 1, atom_u16) /* arguments are not counted in n_pop */
+DEF(tail_call_method, 7, 2, 0, atom_u16) /* arguments are not counted in n_pop */
 DEF(     array_from, 3, 0, 1, npop) /* arguments are not counted in n_pop */
 DEF(          apply, 3, 3, 1, u16)
 DEF(         return, 1, 1, 0, none)

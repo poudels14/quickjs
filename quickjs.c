@@ -8214,6 +8214,31 @@ static JSValue JS_ThrowTypeErrorNotAFunction(JSContext *ctx)
     return JS_ThrowTypeError(ctx, "not a function");
 }
 
+static JSValue JS_ThrowTypeErrorNotAFunctionAtom(JSContext *ctx, JSAtom atom)
+{
+    if (atom == JS_ATOM_NULL)
+        return JS_ThrowTypeErrorNotAFunction(ctx);
+    return JS_ThrowTypeErrorAtom(ctx, "%s is not a function", atom);
+}
+
+static bool JS_ShouldThrowNamedNotAFunction(JSContext *ctx, JSValueConst val)
+{
+    JSObject *p;
+
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return true;
+    p = JS_VALUE_GET_OBJ(val);
+    if (p->class_id == JS_CLASS_PROXY) {
+        JSProxyData *s = p->u.proxy_data;
+        /* Revoked proxies have their own error and should still reach the
+           regular call path. */
+        return s && !s->is_revoked && !s->is_func;
+    }
+    if (p->class_id == JS_CLASS_BYTECODE_FUNCTION)
+        return false;
+    return ctx->rt->class_array[p->class_id].call == NULL;
+}
+
 static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx)
 {
     return JS_ThrowTypeError(ctx, "not an object");
@@ -17453,6 +17478,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
     int opcode, arg_allocated_size, i;
     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
     JSVarRef **var_refs;
+    JSAtom call_name;
     size_t alloca_size;
 
 #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
@@ -17929,16 +17955,23 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_call2):
         CASE(OP_call3):
             call_argc = opcode - OP_call0;
+            call_name = JS_ATOM_NULL;
             goto has_call_argc;
         CASE(OP_call):
         CASE(OP_tail_call):
             {
-                call_argc = get_u16(pc);
-                pc += 2;
+                call_name = get_u32(pc);
+                call_argc = get_u16(pc + 4);
+                pc += 6;
                 goto has_call_argc;
             has_call_argc:
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (call_name != JS_ATOM_NULL &&
+                    unlikely(JS_ShouldThrowNamedNotAFunction(ctx, call_argv[-1]))) {
+                    JS_ThrowTypeErrorNotAFunctionAtom(ctx, call_name);
+                    goto exception;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -17972,10 +18005,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         CASE(OP_call_method):
         CASE(OP_tail_call_method):
             {
-                call_argc = get_u16(pc);
-                pc += 2;
+                JSAtom func_name;
+
+                func_name = get_u32(pc);
+                call_argc = get_u16(pc + 4);
+                pc += 6;
                 call_argv = sp - call_argc;
                 sf->cur_pc = pc;
+                if (func_name != JS_ATOM_NULL &&
+                    unlikely(JS_ShouldThrowNamedNotAFunction(ctx, call_argv[-1]))) {
+                    JS_ThrowTypeErrorNotAFunctionAtom(ctx, func_name);
+                    goto exception;
+                }
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
@@ -18133,6 +18174,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     ret_val = JS_EvalObject(ctx, JS_UNDEFINED, obj,
                                             JS_EVAL_TYPE_DIRECT, scope_idx);
                 } else {
+                    if (unlikely(JS_ShouldThrowNamedNotAFunction(ctx, call_argv[-1]))) {
+                        JS_ThrowTypeErrorNotAFunctionAtom(ctx, JS_ATOM_eval);
+                        goto exception;
+                    }
                     ret_val = JS_CallInternal(ctx, call_argv[-1], JS_UNDEFINED,
                                               JS_UNDEFINED, call_argc,
                                               vc(call_argv), 0);
@@ -24008,6 +24053,7 @@ static __exception int js_parse_template(JSParseState *s, int call, int *argc)
         *argc = depth + 1;
     } else {
         emit_op(s, OP_call_method);
+        emit_atom(s, JS_ATOM_NULL);
         emit_u16(s, depth - 1);
     }
  done1:
@@ -24551,6 +24597,7 @@ static void emit_class_field_init(JSParseState *s)
     emit_op(s, OP_swap);
 
     emit_op(s, OP_call_method);
+    emit_atom(s, JS_ATOM_NULL);
     emit_u16(s, 0);
 
     emit_label(s, label_next);
@@ -24828,6 +24875,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                 emit_op(s, OP_swap);
                 // stack is now: this fclosure
                 emit_op(s, OP_call_method);
+                emit_atom(s, JS_ATOM_NULL);
                 emit_u16(s, 0);
                 // stack is now: returnvalue
                 emit_op(s, OP_drop);
@@ -25162,6 +25210,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
         emit_op(s, OP_dup);
         emit_class_init_end(s, cf);
         emit_op(s, OP_call_method);
+        emit_atom(s, JS_ATOM_NULL);
         emit_u16(s, 0);
         emit_op(s, OP_drop);
     }
@@ -26510,17 +26559,21 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             goto parse_func_call2;
         } else if (s->token.val == '(' && accept_lparen) {
             int opcode, arg_count, drop_count;
+            JSAtom call_name;
 
             /* function call */
         parse_func_call:
+            call_name = JS_ATOM_NULL;
             if (next_token(s))
                 return -1;
 
             if (call_type == FUNC_CALL_NORMAL) {
             parse_func_call2:
+                call_name = JS_ATOM_NULL;
                 emit_source_loc(s);
                 switch(opcode = get_prev_opcode(fd)) {
                 case OP_get_field:
+                    call_name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
                     /* keep the object on the stack */
                     fd->byte_code.buf[fd->last_opcode_pos] = OP_get_field2;
                     drop_count = 2;
@@ -26528,6 +26581,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                 case OP_get_field_opt_chain:
                     {
                         int opt_chain_label, next_label;
+                        call_name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
                         opt_chain_label = get_u32(fd->byte_code.buf +
                                                   fd->last_opcode_pos + 1 + 4 + 1);
                         /* keep the object on the stack */
@@ -26545,6 +26599,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                     }
                     break;
                 case OP_scope_get_private_field:
+                    call_name = get_u32(fd->byte_code.buf + fd->last_opcode_pos + 1);
                     /* keep the object on the stack */
                     fd->byte_code.buf[fd->last_opcode_pos] = OP_scope_get_private_field2;
                     drop_count = 2;
@@ -26583,6 +26638,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                             /* direct 'eval' */
                             opcode = OP_eval;
                         } else {
+                            call_name = name;
                             /* verify if function name resolves to a simple
                                get_loc/get_arg: a function call inside a `with`
                                statement can resolve to a method call of the
@@ -26738,6 +26794,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                 case OP_get_array_el:
                 case OP_scope_get_ref:
                     emit_op(s, OP_call_method);
+                    emit_atom(s, call_name);
                     emit_u16(s, arg_count);
                     break;
                 case OP_eval:
@@ -26763,6 +26820,7 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                         emit_u16(s, arg_count);
                     } else {
                         emit_op(s, OP_call);
+                        emit_atom(s, call_name);
                         emit_u16(s, arg_count);
                     }
                     break;
@@ -27786,6 +27844,7 @@ static void emit_return(JSParseState *s, bool hasval)
                     emit_op(s, OP_is_undefined_or_null);
                     label_next = emit_goto(s, OP_if_true, -1);
                     emit_op(s, OP_call_method);
+                    emit_atom(s, JS_ATOM_NULL);
                     emit_u16(s, 0);
                     emit_op(s, OP_iterator_check_object);
                     emit_op(s, OP_await);
@@ -28207,6 +28266,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
             emit_op(s, OP_dup3);
             emit_op(s, OP_drop);
             emit_op(s, OP_call_method);
+            emit_atom(s, JS_ATOM_NULL);
             emit_u16(s, 0);
             /* get the result of the promise */
             emit_op(s, OP_await);
@@ -32967,6 +33027,7 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
             get_loc_or_ref(bc, is_ref, idx);
             dbuf_putc(bc, OP_check_brand);
             dbuf_putc(bc, OP_call_method);
+            dbuf_put_u32(bc, JS_DupAtom(ctx, JS_ATOM_NULL));
             dbuf_put_u16(bc, 0);
             break;
         case JS_VAR_PRIVATE_SETTER:
@@ -33014,6 +33075,7 @@ static int resolve_scope_private_field(JSContext *ctx, JSFunctionDef *s,
                 dbuf_putc(bc, OP_rot3l);
                 /* obj func value */
                 dbuf_putc(bc, OP_call_method);
+                dbuf_put_u32(bc, JS_DupAtom(ctx, JS_ATOM_NULL));
                 dbuf_put_u16(bc, 1);
                 dbuf_putc(bc, OP_drop);
             }
@@ -34187,11 +34249,10 @@ static void put_short_code(DynBuf *bc_out, int op, int idx)
         case OP_set_var_ref:
             dbuf_putc(bc_out, OP_set_var_ref0 + idx);
             return;
-        case OP_call:
-            dbuf_putc(bc_out, OP_call0 + idx);
-            return;
         }
     }
+    assert(op != OP_call && op != OP_tail_call &&
+           op != OP_call_method && op != OP_tail_call_method);
     if (idx < 256) {
         switch (op) {
         case OP_get_loc:
@@ -34360,19 +34421,29 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_call_method:
             {
                 /* detect and transform tail calls */
+                JSAtom atom;
                 int argc;
-                argc = get_u16(bc_buf + pos + 1);
+                atom = get_u32(bc_buf + pos + 1);
+                argc = get_u16(bc_buf + pos + 5);
                 if (code_match(&cc, pos_next, OP_return, -1)) {
                     if (cc.line_num >= 0) line_num = cc.line_num;
                     if (cc.col_num >= 0) col_num = cc.col_num;
                     add_pc2line_info(s, bc_out.size, line_num, col_num);
-                    put_short_code(&bc_out, op + 1, argc);
+                    dbuf_putc(&bc_out, op + 1);
+                    dbuf_put_u32(&bc_out, atom);
+                    dbuf_put_u16(&bc_out, argc);
                     pos_next = skip_dead_code(s, bc_buf, bc_len, cc.pos,
                                               &line_num, &col_num);
                     break;
                 }
                 add_pc2line_info(s, bc_out.size, line_num, col_num);
-                put_short_code(&bc_out, op, argc);
+                if (op == OP_call && atom == JS_ATOM_NULL && argc < 4) {
+                    dbuf_putc(&bc_out, OP_call0 + argc);
+                } else {
+                    dbuf_putc(&bc_out, op);
+                    dbuf_put_u32(&bc_out, atom);
+                    dbuf_put_u16(&bc_out, argc);
+                }
                 break;
             }
             goto no_change;
@@ -35237,6 +35308,9 @@ static __exception int compute_stack_size(JSContext *ctx,
         /* call pops a variable number of arguments */
         if (oi->fmt == OP_FMT_npop || oi->fmt == OP_FMT_npop_u16) {
             n_pop += get_u16(bc_buf + pos + 1);
+        } else if (op == OP_call || op == OP_tail_call ||
+                   op == OP_call_method || op == OP_tail_call_method) {
+            n_pop += get_u16(bc_buf + pos + 5);
         } else if (oi->fmt == OP_FMT_npopx) {
             n_pop += op - OP_call0;
         }
