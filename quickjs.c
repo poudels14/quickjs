@@ -304,6 +304,13 @@ struct JSRuntime {
     bool in_build_stack_trace;
     /* true if inside JS_FreeRuntime */
     bool in_free;
+    /* Snapshot locals on throw; read back via JS_GetErrorFrames. */
+    bool capture_error_locals;
+    /* Symbol atom under which the CallSite array is stashed on Errors. */
+    JSAtom callsites_atom;
+    /* Cached property keys used to build the result of JS_GetErrorFrames. */
+    JSAtom frame_atoms[6];
+    bool frame_atoms_ready;
 
     struct JSStackFrame *current_stack_frame;
 
@@ -1139,6 +1146,10 @@ typedef struct JSCallSiteData {
     bool native;
     int line_num;
     int col_num;
+    /* args + locals snapshot; NULL when capture is off or frame is native.
+       Names live in func's bytecode vardefs, kept alive via csd->func. */
+    JSValue *locals;
+    uint32_t locals_count;
 } JSCallSiteData;
 
 enum {
@@ -1472,6 +1483,7 @@ static void js_set_uncatchable_error(JSContext *ctx, JSValueConst val,
 static JSValue js_new_callsite(JSContext *ctx, JSCallSiteData *csd);
 static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFrame *sf);
 static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const char *filename, int line_num, int col_num);
+static void js_callsite_free_locals(JSRuntime *rt, JSCallSiteData *csd);
 static void _JS_AddIntrinsicCallSite(JSContext *ctx);
 
 static void JS_SetOpaqueInternal(JSValueConst obj, void *opaque);
@@ -2023,6 +2035,11 @@ void JS_SetRuntimeOpaque(JSRuntime *rt, void *opaque)
     rt->user_opaque = opaque;
 }
 
+void JS_SetCaptureErrorLocals(JSRuntime *rt, bool enable)
+{
+    rt->capture_error_locals = enable;
+}
+
 int JS_AddRuntimeFinalizer(JSRuntime *rt, JSRuntimeFinalizer *finalizer,
                            void *arg)
 {
@@ -2396,6 +2413,18 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
+
+    if (rt->callsites_atom != JS_ATOM_NULL) {
+        JS_FreeAtomRT(rt, rt->callsites_atom);
+        rt->callsites_atom = JS_ATOM_NULL;
+    }
+    if (rt->frame_atoms_ready) {
+        for (i = 0; i < (int)(sizeof(rt->frame_atoms) / sizeof(rt->frame_atoms[0])); i++) {
+            JS_FreeAtomRT(rt, rt->frame_atoms[i]);
+            rt->frame_atoms[i] = JS_ATOM_NULL;
+        }
+        rt->frame_atoms_ready = false;
+    }
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
@@ -7794,6 +7823,24 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
     return JS_ToCString(ctx, val);
 }
 
+/* Private Symbol used to hide the CallSite array from JS-side access. */
+static JSAtom get_callsites_atom(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    if (rt->callsites_atom == JS_ATOM_NULL) {
+        JSValue sym = JS_NewSymbol(ctx, "__callsites__", false);
+        if (JS_IsException(sym)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            return JS_ATOM_NULL;
+        }
+        rt->callsites_atom = JS_ValueToAtom(ctx, sym);
+        JS_FreeValue(ctx, sym);
+        if (rt->callsites_atom == JS_ATOM_NULL)
+            JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    return rt->callsites_atom;
+}
+
 /* Note: it is important that no exception is returned by this function */
 static bool can_add_backtrace(JSValueConst obj)
 {
@@ -7878,6 +7925,9 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         if (stack_trace_limit == 0)
             goto done;
         if (filename) {
+            if (rt->capture_error_locals) {
+                js_new_callsite_data2(ctx, &csd[i], filename, line_num, col_num);
+            }
             i++;
             dbuf_printf(&dbuf, "    at %s", filename);
             if (line_num != -1)
@@ -7920,6 +7970,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         if (has_prepare) {
             js_new_callsite_data(ctx, &csd[i], sf);
         } else {
+            if (rt->capture_error_locals)
+                js_new_callsite_data(ctx, &csd[i], sf);
             /* func_name_str is UTF-8 encoded if needed */
             func_name_str = get_func_name(ctx, sf->cur_func);
             if (!func_name_str || func_name_str[0] == '\0')
@@ -7959,46 +8011,72 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             break;
     }
  done:
-    if (has_prepare) {
-        int j = 0, k;
-        stack = JS_NewArray(ctx);
-        if (JS_IsException(stack)) {
-            stack = JS_NULL;
-        } else {
-            for (; j < i; j++) {
-                JSValue v = js_new_callsite(ctx, &csd[j]);
-                if (JS_IsException(v))
-                    break;
-                if (JS_DefinePropertyValueUint32(ctx, stack, j, v, JS_PROP_C_W_E) < 0) {
-                    JS_FreeValue(ctx, v);
-                    break;
+    {
+        /* prepare needs the array no matter what; capture only needs it if
+           we actually captured at least one frame. */
+        bool need_callsite_array = has_prepare || (rt->capture_error_locals && i > 0);
+        JSValue callsite_array = JS_NULL;
+        if (need_callsite_array) {
+            int j = 0, k;
+            callsite_array = JS_NewArray(ctx);
+            if (JS_IsException(callsite_array)) {
+                callsite_array = JS_NULL;
+            } else {
+                for (; j < i; j++) {
+                    JSValue v = js_new_callsite(ctx, &csd[j]);
+                    if (JS_IsException(v))
+                        break;
+                    if (JS_DefinePropertyValueUint32(ctx, callsite_array, j, v, JS_PROP_C_W_E) < 0) {
+                        JS_FreeValue(ctx, v);
+                        break;
+                    }
                 }
             }
+            // Clear the csd's we didn't use in case of error.
+            for (k = j; k < i; k++) {
+                JS_FreeValue(ctx, csd[k].filename);
+                JS_FreeValue(ctx, csd[k].func);
+                JS_FreeValue(ctx, csd[k].func_name);
+                js_callsite_free_locals(rt, &csd[k]);
+            }
         }
-        // Clear the csd's we didn't use in case of error.
-        for (k = j; k < i; k++) {
-            JS_FreeValue(ctx, csd[k].filename);
-            JS_FreeValue(ctx, csd[k].func);
-            JS_FreeValue(ctx, csd[k].func_name);
+
+        /* Only attach __callsites__ on the *original* throw, the same gate
+           used for the `stack` property. Without this, async/await rethrows
+           (which re-enter build_backtrace via the bytecode exception handler)
+           would overwrite the snapshot with locals of the rethrow frame. */
+        if (rt->capture_error_locals && i > 0 && !JS_IsNull(callsite_array)
+            && can_add_backtrace(error_val)) {
+            JSAtom a = get_callsites_atom(ctx);
+            if (a != JS_ATOM_NULL) {
+                /* dup so prepare (if any) still has its copy */
+                JS_DefinePropertyValue(ctx, error_val, a, js_dup(callsite_array),
+                                       JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE);
+            }
         }
-        JSValueConst args[] = {
-            error_val,
-            stack,
-        };
-        JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
-        JS_FreeValue(ctx, stack);
-        if (JS_IsException(stack2))
-            stack = JS_NULL;
-        else
-            stack = stack2;
-        JS_FreeValue(ctx, prepare);
-        JS_Throw(ctx, saved_exception);
-    } else {
-        if (dbuf_error(&dbuf))
-            stack = JS_NULL;
-        else
-            stack = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
-        dbuf_free(&dbuf);
+
+        if (has_prepare) {
+            JSValueConst args[] = {
+                error_val,
+                callsite_array,
+            };
+            JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
+            JS_FreeValue(ctx, callsite_array);
+            if (JS_IsException(stack2))
+                stack = JS_NULL;
+            else
+                stack = stack2;
+            JS_FreeValue(ctx, prepare);
+            JS_Throw(ctx, saved_exception);
+        } else {
+            if (need_callsite_array)
+                JS_FreeValue(ctx, callsite_array);
+            if (dbuf_error(&dbuf))
+                stack = JS_NULL;
+            else
+                stack = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
+            dbuf_free(&dbuf);
+        }
     }
 
     if (JS_IsUndefined(ctx->error_back_trace))
@@ -60104,6 +60182,18 @@ static void insert_weakref_record(JSValueConst target,
 
 /* CallSite */
 
+static void js_callsite_free_locals(JSRuntime *rt, JSCallSiteData *csd)
+{
+    if (csd->locals) {
+        uint32_t i;
+        for (i = 0; i < csd->locals_count; i++)
+            JS_FreeValueRT(rt, csd->locals[i]);
+        js_free_rt(rt, csd->locals);
+        csd->locals = NULL;
+        csd->locals_count = 0;
+    }
+}
+
 static void js_callsite_finalizer(JSRuntime *rt, JSValueConst val)
 {
     JSCallSiteData *csd = JS_GetOpaque(val, JS_CLASS_CALL_SITE);
@@ -60111,6 +60201,7 @@ static void js_callsite_finalizer(JSRuntime *rt, JSValueConst val)
         JS_FreeValueRT(rt, csd->filename);
         JS_FreeValueRT(rt, csd->func);
         JS_FreeValueRT(rt, csd->func_name);
+        js_callsite_free_locals(rt, csd);
         js_free_rt(rt, csd);
     }
 }
@@ -60123,6 +60214,11 @@ static void js_callsite_mark(JSRuntime *rt, JSValueConst val,
         JS_MarkValue(rt, csd->filename, mark_func);
         JS_MarkValue(rt, csd->func, mark_func);
         JS_MarkValue(rt, csd->func_name, mark_func);
+        if (csd->locals) {
+            uint32_t i;
+            for (i = 0; i < csd->locals_count; i++)
+                JS_MarkValue(rt, csd->locals[i], mark_func);
+        }
     }
 }
 
@@ -60144,10 +60240,67 @@ static JSValue js_new_callsite(JSContext *ctx, JSCallSiteData *csd) {
     return obj;
 }
 
+static void js_callsite_snapshot_locals(JSContext *ctx, JSCallSiteData *csd,
+                                        JSStackFrame *sf, JSFunctionBytecode *b)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue saved_exception;
+    uint32_t n, i;
+    JSValue *locals;
+
+    csd->locals = NULL;
+    csd->locals_count = 0;
+
+    if (!b || !b->vardefs)
+        return;
+
+    n = (uint32_t)b->arg_count + (uint32_t)b->var_count;
+    if (n == 0)
+        return;
+
+    /* Preserve the in-flight throw across our allocation. */
+    saved_exception = rt->current_exception;
+    rt->current_exception = JS_UNINITIALIZED;
+    locals = js_mallocz(ctx, n * sizeof(JSValue));
+    if (!locals) {
+        JS_FreeValue(ctx, rt->current_exception);
+        rt->current_exception = saved_exception;
+        return;
+    }
+    rt->current_exception = saved_exception;
+
+    for (i = 0; i < n; i++) {
+        JSVarDef *vd = &b->vardefs[i];
+        JSValue v = JS_UNINITIALIZED;
+        if (vd->is_captured) {
+            JSVarRef *ref = NULL;
+            if (vd->var_ref_idx < sf->var_ref_count)
+                ref = sf->var_refs[vd->var_ref_idx];
+            if (ref && ref->pvalue)
+                v = *ref->pvalue;
+        } else if (i < b->arg_count) {
+            /* trailing declared args may be absent if called with fewer */
+            if (sf->arg_buf && i < sf->arg_count)
+                v = sf->arg_buf[i];
+        } else {
+            if (sf->var_buf)
+                v = sf->var_buf[i - b->arg_count];
+        }
+        /* refcount bump only; deferred materialization in JS_GetErrorFrames */
+        locals[i] = js_dup(v);
+    }
+
+    csd->locals = locals;
+    csd->locals_count = n;
+}
+
 static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFrame *sf)
 {
     const char *func_name_str;
     JSObject *p;
+
+    csd->locals = NULL;
+    csd->locals_count = 0;
 
     csd->func = js_dup(sf->cur_func);
     /* func_name_str is UTF-8 encoded if needed */
@@ -60175,6 +60328,8 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
             csd->filename = JS_NULL;
             JS_FreeValue(ctx, JS_GetException(ctx)); // Clear exception.
         }
+        if (ctx->rt->capture_error_locals)
+            js_callsite_snapshot_locals(ctx, csd, sf, b);
     } else {
         csd->native = true;
         csd->line_num = -1;
@@ -60185,6 +60340,8 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
 
 static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const char *filename, int line_num, int col_num)
 {
+    csd->locals = NULL;
+    csd->locals_count = 0;
     csd->func = JS_NULL;
     csd->func_name = JS_NULL;
     csd->native = false;
@@ -60250,6 +60407,175 @@ static void _JS_AddIntrinsicCallSite(JSContext *ctx)
     JS_SetPropertyFunctionList(ctx, ctx->class_proto[JS_CLASS_CALL_SITE],
                                js_callsite_proto_funcs,
                                countof(js_callsite_proto_funcs));
+}
+
+/* Build a {name: value} object from a callsite's locals snapshot. The names
+   come from the (still alive) function bytecode kept on csd->func. Uses
+   refcount duplication to hand values out to the caller. */
+static JSValue js_callsite_build_locals_object(JSContext *ctx, JSCallSiteData *csd)
+{
+    JSValue obj;
+    JSObject *p;
+    JSFunctionBytecode *b;
+    uint32_t i;
+
+    obj = JS_NewObject(ctx);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+
+    if (!csd->locals || csd->locals_count == 0)
+        return obj;
+
+    if (JS_VALUE_GET_TAG(csd->func) != JS_TAG_OBJECT)
+        return obj;
+
+    p = JS_VALUE_GET_OBJ(csd->func);
+    if (!js_class_has_bytecode(p->class_id))
+        return obj;
+
+    b = p->u.func.function_bytecode;
+    if (!b || !b->vardefs)
+        return obj;
+
+    for (i = 0; i < csd->locals_count && i < (uint32_t)(b->arg_count + b->var_count); i++) {
+        JSValue v = csd->locals[i];
+        JSAtom name = b->vardefs[i].var_name;
+        if (name == JS_ATOM_NULL)
+            continue;
+        /* Skip uninitialized (TDZ) values rather than surfacing them as
+           undefined, which would be misleading. */
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED)
+            continue;
+        if (JS_DefinePropertyValue(ctx, obj, name, js_dup(v),
+                                   JS_PROP_C_W_E) < 0) {
+            /* swallow & keep going - locals are best-effort */
+            JS_FreeValue(ctx, JS_GetException(ctx));
+        }
+    }
+    return obj;
+}
+
+/* Frame property keys, cached on the runtime. */
+enum {
+    JS_FRAME_ATOM_FUNCTION_NAME = 0,
+    JS_FRAME_ATOM_FILE_NAME,
+    JS_FRAME_ATOM_LINE_NUMBER,
+    JS_FRAME_ATOM_COLUMN_NUMBER,
+    JS_FRAME_ATOM_NATIVE,
+    JS_FRAME_ATOM_LOCALS,
+    JS_FRAME_ATOM_COUNT,
+};
+
+static bool ensure_frame_atoms(JSContext *ctx)
+{
+    JSRuntime *rt = ctx->rt;
+    static const char *const names[JS_FRAME_ATOM_COUNT] = {
+        "functionName", "fileName", "lineNumber",
+        "columnNumber", "native", "locals",
+    };
+    int i;
+    if (rt->frame_atoms_ready)
+        return true;
+    for (i = 0; i < JS_FRAME_ATOM_COUNT; i++) {
+        rt->frame_atoms[i] = JS_NewAtom(ctx, names[i]);
+        if (rt->frame_atoms[i] == JS_ATOM_NULL) {
+            while (--i >= 0) {
+                JS_FreeAtom(ctx, rt->frame_atoms[i]);
+                rt->frame_atoms[i] = JS_ATOM_NULL;
+            }
+            return false;
+        }
+    }
+    rt->frame_atoms_ready = true;
+    return true;
+}
+
+JSValue JS_GetErrorFrames(JSContext *ctx, JSValueConst error, int32_t max_frames)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValue out, arr, prop;
+    JSAtom a;
+    int64_t len;
+    int64_t i;
+
+    out = JS_NewArray(ctx);
+    if (JS_IsException(out))
+        return JS_EXCEPTION;
+
+    if (max_frames == 0)
+        return out;
+    if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
+        return out;
+    if (rt->callsites_atom == JS_ATOM_NULL)
+        return out; /* capture has never run on this runtime */
+    if (!ensure_frame_atoms(ctx)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return out;
+    }
+
+    a = rt->callsites_atom;
+    arr = JS_GetProperty(ctx, error, a);
+    if (JS_IsException(arr)) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        return out;
+    }
+    if (JS_IsUndefined(arr) || JS_IsNull(arr) || !JS_IsArray(arr)) {
+        JS_FreeValue(ctx, arr);
+        return out;
+    }
+    if (JS_GetLength(ctx, arr, &len) < 0) {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, arr);
+        return out;
+    }
+    if (max_frames > 0 && (int64_t)max_frames < len)
+        len = max_frames;
+
+    for (i = 0; i < len; i++) {
+        JSCallSiteData *csd;
+        JSValue frame, locals;
+
+        prop = JS_GetPropertyUint32(ctx, arr, (uint32_t)i);
+        if (JS_IsException(prop)) {
+            JS_FreeValue(ctx, JS_GetException(ctx));
+            continue;
+        }
+        csd = JS_GetOpaque(prop, JS_CLASS_CALL_SITE);
+        if (!csd) {
+            JS_FreeValue(ctx, prop);
+            continue;
+        }
+        frame = JS_NewObject(ctx);
+        if (JS_IsException(frame)) {
+            JS_FreeValue(ctx, prop);
+            JS_FreeValue(ctx, arr);
+            JS_FreeValue(ctx, out);
+            return JS_EXCEPTION;
+        }
+        JS_DefinePropertyValue(ctx, frame, rt->frame_atoms[JS_FRAME_ATOM_FUNCTION_NAME],
+                               js_dup(csd->func_name), JS_PROP_C_W_E);
+        JS_DefinePropertyValue(ctx, frame, rt->frame_atoms[JS_FRAME_ATOM_FILE_NAME],
+                               js_dup(csd->filename), JS_PROP_C_W_E);
+        JS_DefinePropertyValue(ctx, frame, rt->frame_atoms[JS_FRAME_ATOM_LINE_NUMBER],
+                               csd->line_num < 0 ? JS_NULL : JS_NewInt32(ctx, csd->line_num),
+                               JS_PROP_C_W_E);
+        JS_DefinePropertyValue(ctx, frame, rt->frame_atoms[JS_FRAME_ATOM_COLUMN_NUMBER],
+                               csd->col_num < 0 ? JS_NULL : JS_NewInt32(ctx, csd->col_num),
+                               JS_PROP_C_W_E);
+        JS_DefinePropertyValue(ctx, frame, rt->frame_atoms[JS_FRAME_ATOM_NATIVE],
+                               JS_NewBool(ctx, csd->native), JS_PROP_C_W_E);
+        locals = js_callsite_build_locals_object(ctx, csd);
+        if (JS_IsException(locals))
+            locals = JS_NewObject(ctx); /* best-effort fallback */
+        JS_DefinePropertyValue(ctx, frame, rt->frame_atoms[JS_FRAME_ATOM_LOCALS],
+                               locals, JS_PROP_C_W_E);
+
+        JS_DefinePropertyValueUint32(ctx, out, (uint32_t)i, frame, JS_PROP_C_W_E);
+        JS_FreeValue(ctx, prop);
+    }
+
+    JS_FreeValue(ctx, arr);
+    return out;
 }
 
 /* DOMException */

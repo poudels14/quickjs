@@ -837,6 +837,27 @@ JS_EXTERN void JS_ClearUncatchableError(JSContext *ctx, JSValueConst val);
 //  JS_Throw(ctx, exc);
 JS_EXTERN void JS_ResetUncatchableError(JSContext *ctx);
 JS_EXTERN JSValue JS_NewError(JSContext *ctx);
+
+/* If enabled, every Error created by QuickJS will carry a snapshot of the
+   arguments + local variables of each captured stack frame. The cost at
+   throw time is roughly one refcount bump per local; the values are kept
+   alive (acting as GC roots) for the lifetime of the Error object. The
+   snapshot is read back via JS_GetErrorFrames. Off by default. */
+JS_EXTERN void JS_SetCaptureErrorLocals(JSRuntime *rt, bool enable);
+
+/* Return an array of plain objects, one per captured JS stack frame
+   (innermost first). Each entry has the keys:
+     - functionName: string | null
+     - fileName:     string | null
+     - lineNumber:   number | null
+     - columnNumber: number | null
+     - native:       boolean
+     - locals:       { [name: string]: value }
+   max_frames < 0 returns all frames; max_frames == 0 returns an empty
+   array. If capture is off, or the value is not an Error with attached
+   callsites, an empty array is returned. */
+JS_EXTERN JSValue JS_GetErrorFrames(JSContext *ctx, JSValueConst error, int32_t max_frames);
+
 JS_EXTERN JSValue JS_PRINTF_FORMAT_ATTR(2, 3) JS_NewInternalError(JSContext *ctx, JS_PRINTF_FORMAT const char *fmt, ...);
 JS_EXTERN JSValue JS_PRINTF_FORMAT_ATTR(2, 3) JS_NewPlainError(JSContext *ctx, JS_PRINTF_FORMAT const char *fmt, ...);
 JS_EXTERN JSValue JS_PRINTF_FORMAT_ATTR(2, 3) JS_NewRangeError(JSContext *ctx, JS_PRINTF_FORMAT const char *fmt, ...);
